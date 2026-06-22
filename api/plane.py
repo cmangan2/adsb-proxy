@@ -47,16 +47,19 @@ class handler(BaseHTTPRequestHandler):
                              timeout=8, headers=ADSB_HEADERS)
             if r.ok:
                 data = r.json()
+                # Include grounded planes — just need lat/lon
                 ac = next((a for a in data.get("ac", []) if a.get("lat") is not None), None)
                 if ac:
+                    on_ground = ac.get("alt_baro") == "ground" or (ac.get("gs") or 0) < 30 and (ac.get("alt_baro") or 0) < 500
                     return json.dumps({
                         "found": True, "tail": tail, "source": "adsb.lol",
                         "icao": ac.get("hex", ""),
                         "lat":  ac.get("lat"), "lon": ac.get("lon"),
-                        "alt":  ac.get("alt_baro") or ac.get("alt_geom") or 0,
+                        "alt":  0 if ac.get("alt_baro") == "ground" else (ac.get("alt_baro") or ac.get("alt_geom") or 0),
                         "spd":  ac.get("gs") or 0,
                         "hdg":  ac.get("track") or 0,
                         "vert": ac.get("baro_rate") or ac.get("geom_rate") or 0,
+                        "on_ground": on_ground,
                     }).encode()
         except Exception as e:
             print(f"adsb.lol error: {e}")

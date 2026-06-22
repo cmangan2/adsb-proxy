@@ -2,10 +2,5 @@
   "rewrites": [
     { "source": "/plane", "destination": "/api/plane" },
     { "source": "/plane/trace", "destination": "/api/plane" }
-  ],
-  "functions": {
-    "api/plane.py": {
-      "runtime": "python3.9"
-    }
-  }
+  ]
 }

@@ -5,15 +5,16 @@ from urllib.parse import urlparse, parse_qs
 
 HEADERS = {"User-Agent": "MangoWindHub/1.0 skydiving-plane-tracker"}
 FR24_HEADERS = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36",
-    "Accept": "application/json",
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
     "Origin": "https://www.flightradar24.com",
-    "Referer": "https://www.flightradar24.com/"
+    "Referer": "https://www.flightradar24.com/",
+    "fr24-device-id": "web-1234567890"
 }
 
 def fetch_live(tail):
-    """Try adsb.lol then adsb.fi for live position."""
-    # Try adsb.lol
+    # 1. Try adsb.lol
     try:
         r = requests.get(f"https://api.adsb.lol/v2/registration/{tail}", timeout=6, headers=HEADERS)
         if r.ok:
@@ -23,7 +24,7 @@ def fetch_live(tail):
                 return normalize_ac(ac, tail, "adsb.lol")
     except: pass
 
-    # Try adsb.fi
+    # 2. Try adsb.fi
     try:
         r = requests.get(f"https://opendata.adsb.fi/api/v2/reg/{tail}", timeout=6, headers=HEADERS)
         if r.ok:
@@ -33,7 +34,61 @@ def fetch_live(tail):
                 return normalize_ac(ac, tail, "adsb.fi")
     except: pass
 
-    # Try FR24 internal
+    # 3. Try FR24 live feed API (newer endpoint)
+    try:
+        r = requests.get(
+            f"https://data-live.flightradar24.com/zones/fcgi/feed.js?reg={tail}&faa=1&satellite=1&mlat=1&flarm=1&adsb=1&gnd=1&air=1&vehicles=1&estimated=1&maxage=14400&gliders=1&stats=1",
+            timeout=8, headers=FR24_HEADERS)
+        if r.ok:
+            data = r.json()
+            # FR24 feed returns dict of flight_id: [icao, lat, lon, hdg, alt, spd, ...]
+            for key, val in data.items():
+                if key in ("full_count", "version", "stats"): continue
+                if not isinstance(val, list) or len(val) < 9: continue
+                lat, lon = val[1], val[2]
+                if lat and lon:
+                    icao = val[0] if val[0] else ""
+                    hdg  = val[3] or 0
+                    alt  = val[4] or 0
+                    spd  = val[5] or 0
+                    return {
+                        "found": True, "tail": tail, "source": "fr24-live",
+                        "icao": icao.lower(),
+                        "fr24id": str(key),
+                        "lat": lat, "lon": lon,
+                        "alt": alt, "spd": spd, "hdg": hdg,
+                        "vert": 0, "on_ground": alt < 100,
+                    }
+    except: pass
+
+    # 4. Try FR24 search API
+    try:
+        r = requests.get(
+            f"https://www.flightradar24.com/v1/search/web/find?query={tail}&limit=10",
+            timeout=6, headers=FR24_HEADERS)
+        if r.ok:
+            data = r.json()
+            results = data.get("results", [])
+            for item in results:
+                if item.get("type") == "live":
+                    detail = item.get("detail", {})
+                    lat = detail.get("lat")
+                    lon = detail.get("lon")
+                    if lat and lon:
+                        return {
+                            "found": True, "tail": tail, "source": "fr24-search",
+                            "icao": detail.get("icao", "").lower(),
+                            "fr24id": str(detail.get("flight", "")),
+                            "lat": lat, "lon": lon,
+                            "alt": detail.get("alt", 0),
+                            "spd": detail.get("speed", 0),
+                            "hdg": detail.get("heading", 0),
+                            "vert": detail.get("vspeed", 0),
+                            "on_ground": detail.get("on_ground", False),
+                        }
+    except: pass
+
+    # 5. Try FR24 classic API
     try:
         r = requests.get(
             f"https://api.flightradar24.com/common/v1/flight/list.json?fetchBy=reg&query={tail}&limit=1",
@@ -46,9 +101,8 @@ def fetch_live(tail):
                 lat = f.get("lat") or f.get("latitude")
                 lon = f.get("lon") or f.get("longitude")
                 if lat and lon:
-                    on_ground = f.get("on_ground", False) or f.get("gnd", False)
                     return {
-                        "found": True, "tail": tail, "source": "fr24",
+                        "found": True, "tail": tail, "source": "fr24-classic",
                         "icao": f.get("hex") or f.get("icao24") or "",
                         "fr24id": str(f.get("id") or f.get("flight_id") or ""),
                         "lat": lat, "lon": lon,
@@ -56,7 +110,7 @@ def fetch_live(tail):
                         "spd": f.get("speed") or f.get("gs") or 0,
                         "hdg": f.get("heading") or f.get("track") or 0,
                         "vert": f.get("vspeed") or f.get("vert") or 0,
-                        "on_ground": on_ground,
+                        "on_ground": f.get("on_ground", False) or f.get("gnd", False),
                     }
     except: pass
 
@@ -79,7 +133,6 @@ def normalize_ac(ac, tail, source):
     }
 
 def fetch_trace(icao, fr24id=""):
-    """Try adsb.lol trace, then adsb.fi, then FR24 playback."""
     points = []
 
     # Try adsb.lol trace
@@ -92,70 +145,32 @@ def fetch_trace(icao, fr24id=""):
                 if not isinstance(pt, list) or len(pt) < 3: continue
                 lat, lon = pt[1], pt[2]
                 if lat is None or lon is None: continue
-                points.append({
-                    "ts": pt[0], "lat": lat, "lon": lon,
+                points.append({"ts": pt[0], "lat": lat, "lon": lon,
                     "alt": pt[3] if len(pt)>3 else 0,
                     "spd": pt[4] if len(pt)>4 else 0,
                     "hdg": pt[5] if len(pt)>5 else 0,
-                    "vert": pt[6] if len(pt)>6 else 0,
-                })
+                    "vert": pt[6] if len(pt)>6 else 0})
             if points:
                 return {"icao": icao, "source": "adsb.lol", "points": points}
     except: pass
 
-    # Try adsb.fi — they store recent tracks
+    # Try adsb.fi trace
     try:
-        r = requests.get(f"https://opendata.adsb.fi/api/v2/hex/{icao}", timeout=8, headers=HEADERS)
-        if r.ok:
-            data = r.json()
-            ac_list = data.get("aircraft", [])
-            if ac_list:
-                ac = ac_list[0]
-                # adsb.fi doesn't have trace but we can at least get last position
-                # Try their track endpoint
-                r2 = requests.get(f"https://opendata.adsb.fi/api/v2/trace/{icao}", timeout=8, headers=HEADERS)
-                if r2.ok:
-                    tdata = r2.json()
-                    raw = tdata.get("trace", [])
-                    for pt in raw:
-                        if not isinstance(pt, list) or len(pt) < 3: continue
-                        lat, lon = pt[1], pt[2]
-                        if lat is None or lon is None: continue
-                        points.append({
-                            "ts": pt[0], "lat": lat, "lon": lon,
-                            "alt": pt[3] if len(pt)>3 else 0,
-                            "spd": pt[4] if len(pt)>4 else 0,
-                            "hdg": pt[5] if len(pt)>5 else 0,
-                            "vert": pt[6] if len(pt)>6 else 0,
-                        })
-                    if points:
-                        return {"icao": icao, "source": "adsb.fi", "points": points}
+        r2 = requests.get(f"https://opendata.adsb.fi/api/v2/trace/{icao}", timeout=8, headers=HEADERS)
+        if r2.ok:
+            raw = r2.json().get("trace", [])
+            for pt in raw:
+                if not isinstance(pt, list) or len(pt) < 3: continue
+                lat, lon = pt[1], pt[2]
+                if lat is None or lon is None: continue
+                points.append({"ts": pt[0], "lat": lat, "lon": lon,
+                    "alt": pt[3] if len(pt)>3 else 0,
+                    "spd": pt[4] if len(pt)>4 else 0,
+                    "hdg": pt[5] if len(pt)>5 else 0,
+                    "vert": pt[6] if len(pt)>6 else 0})
+            if points:
+                return {"icao": icao, "source": "adsb.fi", "points": points}
     except: pass
-
-    # Try FR24 playback
-    if fr24id:
-        try:
-            r = requests.get(
-                f"https://api.flightradar24.com/common/v1/flight/playback.json?flightId={fr24id}&timestamp=0",
-                timeout=10, headers=FR24_HEADERS)
-            if r.ok:
-                data = r.json()
-                track = data.get("result", {}).get("response", {}).get("data", {}).get("flight", {}).get("track", [])
-                for pt in track:
-                    lat = pt.get("latitude") or pt.get("lat")
-                    lon = pt.get("longitude") or pt.get("lon")
-                    if lat is None or lon is None: continue
-                    points.append({
-                        "ts": pt.get("timestamp") or pt.get("ts") or 0,
-                        "lat": lat, "lon": lon,
-                        "alt": pt.get("altitude") or pt.get("alt") or 0,
-                        "spd": pt.get("speed") or pt.get("spd") or 0,
-                        "hdg": pt.get("heading") or pt.get("hdg") or 0,
-                        "vert": pt.get("verticalSpeed") or pt.get("vert") or 0,
-                    })
-                if points:
-                    return {"icao": icao, "source": "fr24", "points": points}
-        except: pass
 
     return {"icao": icao, "source": "none", "points": []}
 

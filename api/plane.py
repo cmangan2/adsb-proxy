@@ -132,8 +132,45 @@ def normalize_ac(ac, tail, source):
         "on_ground": on_ground,
     }
 
-def fetch_trace(icao, fr24id=""):
+def fetch_trace(icao, fr24id="", source=None, date=None):
     points = []
+
+    # Try globe_history for full day trace
+    if source == "history" and date:
+        try:
+            sub = icao[-2:]
+            url = f"https://globe_history.adsb.lol/{date.replace('-','/')}/traces/{sub}/trace_full_{icao}.json"
+            r = requests.get(url, timeout=15, headers=HEADERS)
+            if r.ok:
+                data = r.json()
+                raw = data.get("trace", [])
+                # Reference timestamp is in the JSON
+                ref_ts = data.get("timestamp", 0)
+                for pt in raw:
+                    if not isinstance(pt, list) or len(pt) < 3: continue
+                    # Format: [offset_seconds, lat, lon, alt, flags, spd, hdg, vert, ...]
+                    ts_offset = pt[0]
+                    lat, lon = pt[1], pt[2]
+                    if lat is None or lon is None: continue
+                    alt  = pt[3] if len(pt)>3 and pt[3] not in (None, "") else 0
+                    spd  = pt[6] if len(pt)>6 and pt[6] not in (None, "") else 0
+                    hdg  = pt[5] if len(pt)>5 and pt[5] not in (None, "") else 0
+                    vert = pt[7] if len(pt)>7 and pt[7] not in (None, "") else 0
+                    try:
+                        alt  = float(alt)  if alt  else 0
+                        spd  = float(spd)  if spd  else 0
+                        hdg  = float(hdg)  if hdg  else 0
+                        vert = float(vert) if vert else 0
+                    except: alt=spd=hdg=vert=0
+                    points.append({
+                        "ts": ref_ts + ts_offset,
+                        "lat": lat, "lon": lon,
+                        "alt": alt, "spd": spd, "hdg": hdg, "vert": vert
+                    })
+                if points:
+                    return {"icao": icao, "source": "globe_history", "points": points}
+        except Exception as e:
+            pass  # fall through to live trace
 
     # Try adsb.lol trace
     try:
@@ -183,9 +220,11 @@ class handler(BaseHTTPRequestHandler):
         trace  = params.get("trace",   [None])[0]
         fr24id = (params.get("fr24id", [None])[0] or "").strip()
 
+        source = (params.get("source", [None])[0] or "").strip()
+        date   = (params.get("date",   [None])[0] or "").strip()
         try:
             if icao and trace:
-                result = fetch_trace(icao, fr24id)
+                result = fetch_trace(icao, fr24id, source=source, date=date)
             elif tail:
                 result = fetch_live(tail)
             else:

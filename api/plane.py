@@ -237,6 +237,58 @@ def fetch_trace(icao):
     return {"icao": icao, "source": "none", "points": []}
 
 
+FAST_KT       = 45     # ground speed at/above this counts as flying (Caravan stalls ~60 kt)
+SLOW_END_S    = 180    # this long below FAST_KT ends a flight (landing + rollout/taxi)
+GAP_END_S     = 600    # a silence this long in the data also separates flights
+KEEP_SLOW_S   = 60     # keep this much rollout after a landing, drop the rest of the taxi
+MIN_FLIGHT_PTS = 8
+MIN_FLIGHT_S   = 120   # ignore blips (fast taxi, rejected takeoff)
+MIN_ALT_SPAN   = 400   # a real flight climbs/descends at least this many feet
+GAP_SOFT_S     = 90    # after a gap this long, a candidate that isn't a real flight is dropped
+
+
+def _is_flight(pts):
+    if len(pts) < MIN_FLIGHT_PTS or pts[-1]["ts"] - pts[0]["ts"] < MIN_FLIGHT_S:
+        return False
+    alts = [p["alt"] for p in pts]
+    return max(alts) - min(alts) >= MIN_ALT_SPAN
+
+
+def split_flights(points):
+    """Split a day's trace into separate flights (takeoff to landing). Returns a list of
+    point lists in time order. A flight ends after SLOW_END_S below FAST_KT, or after a
+    GAP_END_S silence; the next fast point starts a new one."""
+    flights, cur = [], []
+    slow_since = None
+    prev_ts = None
+
+    def close():
+        if _is_flight(cur):
+            flights.append(list(cur))
+
+    for p in points:
+        ts = p["ts"]
+        if prev_ts is not None and cur:
+            gap = ts - prev_ts
+            if gap > GAP_END_S:
+                close(); cur.clear(); slow_since = None
+            elif gap > GAP_SOFT_S and not _is_flight(cur):
+                cur.clear(); slow_since = None   # fast-taxi blip, not a flight
+        prev_ts = ts
+        if p["spd"] >= FAST_KT:
+            if slow_since is not None and ts - slow_since >= SLOW_END_S and cur:
+                close(); cur.clear()
+            slow_since = None
+            cur.append(p)
+        else:
+            if slow_since is None:
+                slow_since = ts
+            if cur and ts - slow_since <= KEEP_SLOW_S:
+                cur.append(p)
+    close()
+    return flights
+
+
 def _downsample(points, cap):
     if len(points) <= cap:
         return points
@@ -247,9 +299,24 @@ def _downsample(points, cap):
     return out
 
 
-def fetch_tail(tail):
-    """Live position (if airborne) plus today's trail, so grounded planes still return data."""
+def fetch_tail(tail, want_trail=False, all_flights=False):
+    """Live position (if airborne). With want_trail=True, also today's trail from adsb.lol:
+    only the most recent flight unless all_flights=True.
+
+    The trail is opt-in on purpose: the live-tracking poll hits this every few seconds and
+    must stay tiny and fast. Only the hourly poller / "Fetch Plane Data" ask for the trail."""
     icao = n_to_icao(tail)
+
+    if not want_trail:
+        live = fetch_live(tail)
+        result = dict(live)
+        result["tail"] = tail
+        hexcode = (live.get("icao") or "").lower() or icao or ""
+        result["icao24"] = icao or hexcode
+        if hexcode and not result.get("icao"):
+            result["icao"] = hexcode
+        return result
+
     if icao:
         # US tail: hex is known up front, so live lookup and trace run in parallel
         with ThreadPoolExecutor(max_workers=2) as ex:
@@ -270,13 +337,25 @@ def fetch_tail(tail):
     result["icao24"] = icao or result.get("icao", "")
 
     pts = trace.get("points", [])
-    trail = [{"lat": p["lat"], "lon": p["lon"], "alt": p["alt"], "ts": p["ts"]} for p in _downsample(pts, MAX_TRAIL_PTS)]
+    flights = split_flights(pts)
+    if all_flights:
+        chosen = pts
+        result["trail_scope"] = "full_day"
+    else:
+        chosen = flights[-1] if flights else []
+        result["trail_scope"] = "latest_flight"
+    trail = [{"lat": p["lat"], "lon": p["lon"], "alt": p["alt"], "ts": p["ts"]} for p in _downsample(chosen, MAX_TRAIL_PTS)]
     result["trail"] = trail
     result["trail_source"] = trace.get("source", "none")
     result["trail_points_total"] = len(pts)
+    result["flights_total"] = len(flights)
+    if chosen:
+        result["flight_start"] = chosen[0]["ts"]
+        result["flight_end"] = chosen[-1]["ts"]
+        result["max_alt"] = max(p["alt"] for p in chosen)
     if pts:
         result["last_seen"] = pts[-1]["ts"]
-    result["timestamp"] = pts[-1]["ts"] if pts else time.time()
+    result["timestamp"] = chosen[-1]["ts"] if chosen else (pts[-1]["ts"] if pts else time.time())
     return result
 
 
@@ -286,11 +365,13 @@ class handler(BaseHTTPRequestHandler):
         tail  = (params.get("tail", [None])[0] or "").upper().strip()
         icao  = (params.get("icao", [None])[0] or "").lower().strip()
         trace = params.get("trace", [None])[0]
+        want_trail  = (params.get("trail",   [""])[0] or "").lower() in ("1", "true", "yes")
+        all_flights = (params.get("flights", [""])[0] or "").lower() == "all"
         try:
             if icao and trace:
                 result = fetch_trace(icao)
             elif tail:
-                result = fetch_tail(tail)
+                result = fetch_tail(tail, want_trail=want_trail, all_flights=all_flights)
             else:
                 result = {"error": "tail or icao required"}
         except Exception as e:

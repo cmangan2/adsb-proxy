@@ -346,8 +346,17 @@ def fetch_tail(tail, want_trail=False, all_flights=False, meta_only=False):
         result["trail_scope"] = "latest_flight"
     if meta_only:
         # debugging view: which flights were detected, without any points
+        def profile(f):
+            # altitude every 3 min, so climbs/descents/landings are visible without the points
+            out, nxt = [], f[0]["ts"]
+            for p in f:
+                if p["ts"] >= nxt:
+                    out.append([round((p["ts"] - f[0]["ts"]) / 60.0, 1), int(p["alt"]), int(p["spd"])])
+                    nxt = p["ts"] + 180
+            return out
         result["flights"] = [{"start": f[0]["ts"], "end": f[-1]["ts"], "points": len(f),
-                              "max_alt": max(p["alt"] for p in f)} for f in flights]
+                              "max_alt": max(p["alt"] for p in f), "min_alt": min(p["alt"] for p in f),
+                              "profile_min_alt_kt": profile(f)} for f in flights]
     else:
         result["trail"] = [{"lat": p["lat"], "lon": p["lon"], "alt": p["alt"], "ts": p["ts"]}
                            for p in _downsample(chosen, MAX_TRAIL_PTS)]

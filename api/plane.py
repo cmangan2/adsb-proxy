@@ -237,13 +237,18 @@ def fetch_trace(icao):
     return {"icao": icao, "source": "none", "points": []}
 
 
+LOW_BAND      = 700    # within this many ft of field level counts as "on the ground / landing"
+MIN_CLIMB     = 1500   # a flight must climb at least this far above field level
+MAX_EDGE_GAP  = 300    # only attach the liftoff/touchdown point if it is this close in time (s)
+MIN_FLIGHT_PTS = 8
+MIN_FLIGHT_S   = 120   # ignore blips (fast taxi, rejected takeoff)
+MIN_ALT_SPAN   = 400   # a real flight climbs/descends at least this many feet
+
+# speed-based fallback (only used when a trace has almost no usable altitude data)
 FAST_KT       = 45     # ground speed at/above this counts as flying (Caravan stalls ~60 kt)
 SLOW_END_S    = 180    # this long below FAST_KT ends a flight (landing + rollout/taxi)
 GAP_END_S     = 600    # a silence this long in the data also separates flights
 KEEP_SLOW_S   = 60     # keep this much rollout after a landing, drop the rest of the taxi
-MIN_FLIGHT_PTS = 8
-MIN_FLIGHT_S   = 120   # ignore blips (fast taxi, rejected takeoff)
-MIN_ALT_SPAN   = 400   # a real flight climbs/descends at least this many feet
 GAP_SOFT_S     = 90    # after a gap this long, a candidate that isn't a real flight is dropped
 
 
@@ -254,10 +259,59 @@ def _is_flight(pts):
     return max(alts) - min(alts) >= MIN_ALT_SPAN
 
 
+def _median3(vals):
+    out = []
+    for i in range(len(vals)):
+        w = sorted(vals[max(0, i - 1):i + 2])
+        out.append(w[len(w) // 2])
+    return out
+
+
 def split_flights(points):
-    """Split a day's trace into separate flights (takeoff to landing). Returns a list of
-    point lists in time order. A flight ends after SLOW_END_S below FAST_KT, or after a
-    GAP_END_S silence; the next fast point starts a new one."""
+    """Split a day's trace into separate flights (one per load: takeoff to touchdown).
+
+    Altitude is the signal: every touchdown brings the plane back to field level, and
+    skydiving turnarounds are often too quick (or too poorly covered) for the ground-speed
+    rule to see them. The field level is estimated from the trace itself (low percentile of
+    its altitudes); a flight is a stretch above field level + LOW_BAND that climbs at least
+    MIN_CLIMB, with the liftoff and touchdown points attached."""
+    pos = sorted(p["alt"] for p in points if p["alt"] > 0)
+    if len(pos) < 20:
+        return split_flights_by_speed(points)
+
+    base = pos[int(len(pos) * 0.02)]               # ~field elevation (MSL ft)
+    low_thr = base + LOW_BAND
+    high_thr = base + MIN_CLIMB
+    af = _median3([p["alt"] for p in points])      # median filter: ignore single-point glitches
+
+    flights, cur, last_low = [], [], None
+
+    def add(air, liftoff, touchdown):
+        if not air or max(af[k] for k in air) < high_thr:
+            return
+        pts = [points[k] for k in air]
+        if liftoff is not None and points[air[0]]["ts"] - points[liftoff]["ts"] <= MAX_EDGE_GAP:
+            pts.insert(0, points[liftoff])
+        if touchdown is not None and points[touchdown]["ts"] - points[air[-1]]["ts"] <= MAX_EDGE_GAP:
+            pts.append(points[touchdown])
+        if _is_flight(pts):
+            flights.append(pts)
+
+    for i in range(len(points)):
+        if af[i] <= low_thr:
+            if cur:
+                add(cur, last_low, i)      # touchdown ends this flight
+                cur = []
+            last_low = i
+        else:
+            cur.append(i)
+    add(cur, last_low, None)               # still airborne at the end of the data
+    return flights
+
+
+def split_flights_by_speed(points):
+    """Fallback: split on ground speed. A flight ends after SLOW_END_S below FAST_KT, or
+    after a GAP_END_S silence; the next fast point starts a new one."""
     flights, cur = [], []
     slow_since = None
     prev_ts = None

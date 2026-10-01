@@ -299,7 +299,7 @@ def _downsample(points, cap):
     return out
 
 
-def fetch_tail(tail, want_trail=False, all_flights=False):
+def fetch_tail(tail, want_trail=False, all_flights=False, meta_only=False):
     """Live position (if airborne). With want_trail=True, also today's trail from adsb.lol:
     only the most recent flight unless all_flights=True.
 
@@ -344,8 +344,13 @@ def fetch_tail(tail, want_trail=False, all_flights=False):
     else:
         chosen = flights[-1] if flights else []
         result["trail_scope"] = "latest_flight"
-    trail = [{"lat": p["lat"], "lon": p["lon"], "alt": p["alt"], "ts": p["ts"]} for p in _downsample(chosen, MAX_TRAIL_PTS)]
-    result["trail"] = trail
+    if meta_only:
+        # debugging view: which flights were detected, without any points
+        result["flights"] = [{"start": f[0]["ts"], "end": f[-1]["ts"], "points": len(f),
+                              "max_alt": max(p["alt"] for p in f)} for f in flights]
+    else:
+        result["trail"] = [{"lat": p["lat"], "lon": p["lon"], "alt": p["alt"], "ts": p["ts"]}
+                           for p in _downsample(chosen, MAX_TRAIL_PTS)]
     result["trail_source"] = trace.get("source", "none")
     result["trail_points_total"] = len(pts)
     result["flights_total"] = len(flights)
@@ -365,13 +370,14 @@ class handler(BaseHTTPRequestHandler):
         tail  = (params.get("tail", [None])[0] or "").upper().strip()
         icao  = (params.get("icao", [None])[0] or "").lower().strip()
         trace = params.get("trace", [None])[0]
-        want_trail  = (params.get("trail",   [""])[0] or "").lower() in ("1", "true", "yes")
+        trail_arg   = (params.get("trail",   [""])[0] or "").lower()
+        want_trail  = trail_arg in ("1", "true", "yes", "meta")
         all_flights = (params.get("flights", [""])[0] or "").lower() == "all"
         try:
             if icao and trace:
                 result = fetch_trace(icao)
             elif tail:
-                result = fetch_tail(tail, want_trail=want_trail, all_flights=all_flights)
+                result = fetch_tail(tail, want_trail=want_trail, all_flights=all_flights, meta_only=(trail_arg == "meta"))
             else:
                 result = {"error": "tail or icao required"}
         except Exception as e:

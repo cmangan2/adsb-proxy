@@ -427,6 +427,87 @@ def fetch_tail(tail, want_trail=False, all_flights=False, meta_only=False):
     return result
 
 
+# ---------------------------------------------------------------------------
+# ?debug=1 — hit every upstream directly and report what came back. The normal paths swallow
+# errors (a 403 and "no data" look the same), so this is how to see why a lookup came back empty.
+# ---------------------------------------------------------------------------
+BROWSER_HEADERS = {
+    "User-Agent": FR24_HEADERS["User-Agent"],
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+
+
+def _probe(name, url, headers, inspect):
+    t0 = time.time()
+    out = {"name": name, "url": url}
+    try:
+        r = requests.get(url, timeout=TRACE_TIMEOUT, headers=headers)
+        out.update(status=r.status_code, ms=int((time.time() - t0) * 1000), bytes=len(r.content),
+                   content_type=r.headers.get("Content-Type", ""))
+        if r.headers.get("Server"):
+            out["server"] = r.headers.get("Server")
+        if r.ok:
+            try:
+                out["result"] = inspect(r.json())
+            except Exception as e:
+                out["result"] = f"not JSON: {e}"
+                out["body_start"] = r.text[:200]
+        else:
+            out["body_start"] = r.text[:200]
+    except Exception as e:
+        out.update(ms=int((time.time() - t0) * 1000), error=f"{type(e).__name__}: {e}")
+    return out
+
+
+def _count_ac(d):
+    acs = d.get("ac") or d.get("aircraft") or []
+    with_pos = [a for a in acs if a.get("lat") is not None]
+    res = {"aircraft": len(acs), "with_position": len(with_pos)}
+    if with_pos:
+        a = with_pos[0]
+        res.update(lat=a.get("lat"), lon=a.get("lon"), alt=a.get("alt_baro"), gs=a.get("gs"), seen=a.get("seen"))
+    return res
+
+
+def _count_trace(d):
+    pts = d.get("trace") or []
+    res = {"points": len(pts), "timestamp": d.get("timestamp")}
+    if pts:
+        res["last_point_age_s"] = int(time.time() - ((d.get("timestamp") or 0) + pts[-1][0]))
+    return res
+
+
+def run_debug(tail, icao):
+    icao = icao or n_to_icao(tail) or ""
+    sub = icao[-2:]
+    ref = {"Referer": "https://adsb.lol/", "Origin": "https://adsb.lol"}
+    probes = [("egress_ip", "https://api.ipify.org?format=json", HEADERS, lambda d: d)]
+    if tail:
+        probes += [
+            ("adsb.lol live by reg (used)", f"https://api.adsb.lol/v2/registration/{tail}", HEADERS, _count_ac),
+            ("adsb.lol live by reg, browser headers", f"https://api.adsb.lol/v2/registration/{tail}", BROWSER_HEADERS, _count_ac),
+            ("adsb.fi live /reg/ (used)", f"https://opendata.adsb.fi/api/v2/reg/{tail}", HEADERS, _count_ac),
+            ("adsb.fi live /registration/", f"https://opendata.adsb.fi/api/v2/registration/{tail}", HEADERS, _count_ac),
+        ]
+    if len(icao) == 6:
+        probes += [
+            ("adsb.lol live by hex", f"https://api.adsb.lol/v2/hex/{icao}", HEADERS, _count_ac),
+            ("adsb.fi live by hex", f"https://opendata.adsb.fi/api/v2/hex/{icao}", HEADERS, _count_ac),
+            ("adsb.lol trace_full (used)", f"https://adsb.lol/data/traces/{sub}/trace_full_{icao}.json", HEADERS, _count_trace),
+            ("adsb.lol trace_recent (used)", f"https://adsb.lol/data/traces/{sub}/trace_recent_{icao}.json", HEADERS, _count_trace),
+            ("adsb.lol trace_full, browser headers + referer", f"https://adsb.lol/data/traces/{sub}/trace_full_{icao}.json",
+             {**BROWSER_HEADERS, **ref}, _count_trace),
+            ("globe.adsb.lol trace_full, browser headers + referer", f"https://globe.adsb.lol/data/traces/{sub}/trace_full_{icao}.json",
+             {**BROWSER_HEADERS, **ref}, _count_trace),
+            ("adsbexchange trace_full, browser headers + referer", f"https://globe.adsbexchange.com/data/traces/{sub}/trace_full_{icao}.json",
+             {**BROWSER_HEADERS, "Referer": "https://globe.adsbexchange.com/"}, _count_trace),
+        ]
+    with ThreadPoolExecutor(max_workers=len(probes)) as ex:
+        results = list(ex.map(lambda p: _probe(*p), probes))
+    return {"debug": True, "tail": tail, "icao": icao, "checked_at": int(time.time()), "probes": results}
+
+
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
         params = parse_qs(urlparse(self.path).query)
@@ -436,8 +517,11 @@ class handler(BaseHTTPRequestHandler):
         trail_arg   = (params.get("trail",   [""])[0] or "").lower()
         want_trail  = trail_arg in ("1", "true", "yes", "meta")
         all_flights = (params.get("flights", [""])[0] or "").lower() == "all"
+        debug = (params.get("debug", [""])[0] or "").lower() in ("1", "true", "yes")
         try:
-            if icao and trace:
+            if debug and (tail or icao):
+                result = run_debug(tail, icao)
+            elif icao and trace:
                 result = fetch_trace(icao)
             elif tail:
                 result = fetch_tail(tail, want_trail=want_trail, all_flights=all_flights, meta_only=(trail_arg == "meta"))

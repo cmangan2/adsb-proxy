@@ -92,7 +92,7 @@ def _live_adsblol(tail):
 
 
 def _live_adsbfi(tail):
-    r = requests.get(f"https://opendata.adsb.fi/api/v2/reg/{tail}", timeout=LIVE_TIMEOUT, headers=HEADERS)
+    r = requests.get(f"https://opendata.adsb.fi/api/v2/registration/{tail}", timeout=LIVE_TIMEOUT, headers=HEADERS)
     if r.ok:
         data = r.json()
         ac = next((a for a in (data.get("aircraft") or data.get("ac") or []) if a.get("lat") is not None), None)
@@ -487,8 +487,8 @@ def run_debug(tail, icao):
         probes += [
             ("adsb.lol live by reg (used)", f"https://api.adsb.lol/v2/registration/{tail}", HEADERS, _count_ac),
             ("adsb.lol live by reg, browser headers", f"https://api.adsb.lol/v2/registration/{tail}", BROWSER_HEADERS, _count_ac),
-            ("adsb.fi live /reg/ (used)", f"https://opendata.adsb.fi/api/v2/reg/{tail}", HEADERS, _count_ac),
-            ("adsb.fi live /registration/", f"https://opendata.adsb.fi/api/v2/registration/{tail}", HEADERS, _count_ac),
+            ("adsb.fi live /reg/ (old path, 400)", f"https://opendata.adsb.fi/api/v2/reg/{tail}", HEADERS, _count_ac),
+            ("adsb.fi live /registration/ (used)", f"https://opendata.adsb.fi/api/v2/registration/{tail}", HEADERS, _count_ac),
         ]
     if len(icao) == 6:
         probes += [

@@ -185,10 +185,25 @@ def normalize_ac(ac, tail, source):
 
 
 # ---------------------------------------------------------------------------
-# Today's trace (UTC day) from adsb.lol's tar1090 data
-#   https://adsb.lol/data/traces/{last 2 hex chars}/trace_full_{hex}.json
+# Today's trace (UTC day) from tar1090 trace files:
+#   {host}/data/traces/{last 2 hex chars}/trace_full_{hex}.json   (whole day, rewritten every ~15-20 min)
+#   {host}/data/traces/{last 2 hex chars}/trace_recent_{hex}.json (last few minutes, rewritten often)
 # Point format: [seconds_offset, lat, lon, alt_ft|"ground", gs, track, flags, vrate, ...]
+# Sources in order: ADS-B Exchange, then adsb.lol (its trace files sit behind a bot check
+# since Oct 2026 and return 403; kept in case that is lifted).
 # ---------------------------------------------------------------------------
+BROWSER_HEADERS = {
+    "User-Agent": FR24_HEADERS["User-Agent"],
+    "Accept": "application/json, text/plain, */*",
+    "Accept-Language": "en-US,en;q=0.9",
+}
+TRACE_SOURCES = [
+    ("adsbexchange", "https://globe.adsbexchange.com",
+     {**BROWSER_HEADERS, "Referer": "https://globe.adsbexchange.com/"}),
+    ("adsb.lol", "https://adsb.lol", HEADERS),
+]
+
+
 def _num(v, default=0.0):
     if v is None or v == "":
         return default
@@ -200,41 +215,61 @@ def _num(v, default=0.0):
         return default
 
 
+def _get_trace_file(url, headers):
+    """-> (data dict, points list, error string or None)"""
+    try:
+        r = requests.get(url, timeout=TRACE_TIMEOUT, headers=headers)
+        if r.status_code == 404:
+            return {}, [], None   # no file = plane not seen today, not an error
+        if not r.ok:
+            return {}, [], f"HTTP {r.status_code}"
+        data = r.json()
+    except Exception as e:
+        return {}, [], f"{type(e).__name__}"
+    ref_ts = data.get("timestamp", 0) or 0
+    points = []
+    for pt in data.get("trace", []):
+        if not isinstance(pt, list) or len(pt) < 3:
+            continue
+        lat, lon = pt[1], pt[2]
+        if lat is None or lon is None:
+            continue
+        points.append({
+            "ts":   ref_ts + pt[0],
+            "lat":  lat,
+            "lon":  lon,
+            "alt":  _num(pt[3] if len(pt) > 3 else None),
+            "spd":  _num(pt[4] if len(pt) > 4 else None),
+            "hdg":  _num(pt[5] if len(pt) > 5 else None),
+            "vert": _num(pt[7] if len(pt) > 7 else None),
+        })
+    return data, points, None
+
+
 def fetch_trace(icao):
     icao = (icao or "").lower().strip()
     if len(icao) != 6:
         return {"icao": icao, "source": "none", "points": []}
     sub = icao[-2:]
-    for name in (f"trace_full_{icao}.json", f"trace_recent_{icao}.json"):
-        try:
-            r = requests.get(f"https://adsb.lol/data/traces/{sub}/{name}",
-                             timeout=TRACE_TIMEOUT, headers=HEADERS)
-            if not r.ok:
-                continue
-            data = r.json()
-            ref_ts = data.get("timestamp", 0) or 0
-            points = []
-            for pt in data.get("trace", []):
-                if not isinstance(pt, list) or len(pt) < 3:
-                    continue
-                lat, lon = pt[1], pt[2]
-                if lat is None or lon is None:
-                    continue
-                points.append({
-                    "ts":   ref_ts + pt[0],
-                    "lat":  lat,
-                    "lon":  lon,
-                    "alt":  _num(pt[3] if len(pt) > 3 else None),
-                    "spd":  _num(pt[4] if len(pt) > 4 else None),
-                    "hdg":  _num(pt[5] if len(pt) > 5 else None),
-                    "vert": _num(pt[7] if len(pt) > 7 else None),
-                })
-            if points:
-                return {"icao": icao, "source": "adsb.lol", "reg": data.get("r", ""),
-                        "type": data.get("t", ""), "points": points}
-        except Exception:
-            continue
-    return {"icao": icao, "source": "none", "points": []}
+    errors = {}
+    for source, host, headers in TRACE_SOURCES:
+        urls = [f"{host}/data/traces/{sub}/trace_full_{icao}.json",
+                f"{host}/data/traces/{sub}/trace_recent_{icao}.json"]
+        with ThreadPoolExecutor(max_workers=2) as ex:
+            (full_d, full, full_err), (rec_d, recent, rec_err) = ex.map(lambda u: _get_trace_file(u, headers), urls)
+        # the full file lags by up to ~20 min: append the recent file's newer points
+        last = full[-1]["ts"] if full else float("-inf")
+        points = full + [p for p in recent if p["ts"] > last]
+        if points:
+            meta = full_d or rec_d
+            return {"icao": icao, "source": source, "reg": meta.get("r", ""),
+                    "type": meta.get("t", ""), "points": points}
+        if full_err or rec_err:
+            errors[source] = full_err or rec_err
+    out = {"icao": icao, "source": "none", "points": []}
+    if errors:
+        out["errors"] = errors
+    return out
 
 
 LOW_BAND      = 700    # within this many ft of field level counts as "on the ground / landing"
@@ -415,6 +450,8 @@ def fetch_tail(tail, want_trail=False, all_flights=False, meta_only=False):
         result["trail"] = [{"lat": p["lat"], "lon": p["lon"], "alt": p["alt"], "ts": p["ts"]}
                            for p in _downsample(chosen, MAX_TRAIL_PTS)]
     result["trail_source"] = trace.get("source", "none")
+    if trace.get("errors"):
+        result["trail_errors"] = trace["errors"]
     result["trail_points_total"] = len(pts)
     result["flights_total"] = len(flights)
     if chosen:
@@ -431,13 +468,6 @@ def fetch_tail(tail, want_trail=False, all_flights=False, meta_only=False):
 # ?debug=1 — hit every upstream directly and report what came back. The normal paths swallow
 # errors (a 403 and "no data" look the same), so this is how to see why a lookup came back empty.
 # ---------------------------------------------------------------------------
-BROWSER_HEADERS = {
-    "User-Agent": FR24_HEADERS["User-Agent"],
-    "Accept": "application/json, text/plain, */*",
-    "Accept-Language": "en-US,en;q=0.9",
-}
-
-
 def _probe(name, url, headers, inspect):
     t0 = time.time()
     out = {"name": name, "url": url}

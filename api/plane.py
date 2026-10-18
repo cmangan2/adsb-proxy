@@ -302,17 +302,19 @@ def _median3(vals):
     return out
 
 
-def split_flights(points):
+def split_flights(points, state=None):
     """Split a day's trace into separate flights (one per load: takeoff to touchdown).
 
     Altitude is the signal: every touchdown brings the plane back to field level, and
     skydiving turnarounds are often too quick (or too poorly covered) for the ground-speed
     rule to see them. The field level is estimated from the trace itself (low percentile of
     its altitudes); a flight is a stretch above field level + LOW_BAND that climbs at least
-    MIN_CLIMB, with the liftoff and touchdown points attached."""
+    MIN_CLIMB, with the liftoff and touchdown points attached.
+    If `state` is a dict, state["last_open"] says whether the last flight never touched down
+    (the data ends with the plane still in the air)."""
     pos = sorted(p["alt"] for p in points if p["alt"] > 0)
     if len(pos) < 20:
-        return split_flights_by_speed(points)
+        return split_flights_by_speed(points, state)
 
     base = pos[int(len(pos) * 0.02)]               # ~field elevation (MSL ft)
     low_thr = base + LOW_BAND
@@ -340,11 +342,14 @@ def split_flights(points):
             last_low = i
         else:
             cur.append(i)
+    n_before = len(flights)
     add(cur, last_low, None)               # still airborne at the end of the data
+    if state is not None:
+        state["last_open"] = len(flights) > n_before
     return flights
 
 
-def split_flights_by_speed(points):
+def split_flights_by_speed(points, state=None):
     """Fallback: split on ground speed. A flight ends after SLOW_END_S below FAST_KT, or
     after a GAP_END_S silence; the next fast point starts a new one."""
     flights, cur = [], []
@@ -374,7 +379,11 @@ def split_flights_by_speed(points):
                 slow_since = ts
             if cur and ts - slow_since <= KEEP_SLOW_S:
                 cur.append(p)
+    n_before = len(flights)
     close()
+    if state is not None:
+        # still fast at the end of the data = no landing yet
+        state["last_open"] = len(flights) > n_before and slow_since is None
     return flights
 
 
@@ -388,9 +397,13 @@ def _downsample(points, cap):
     return out
 
 
-def fetch_tail(tail, want_trail=False, all_flights=False, meta_only=False):
-    """Live position (if airborne). With want_trail=True, also today's trail from adsb.lol:
-    only the most recent flight unless all_flights=True.
+CURRENT_FRESH_S = 600   # an unfinished flight whose last point is newer than this is still flying
+
+
+def fetch_tail(tail, want_trail=False, all_flights=False, meta_only=False, completed=False):
+    """Live position (if airborne). With want_trail=True, also today's trail (ADS-B Exchange /
+    adsb.lol): only the most recent flight unless all_flights=True. With completed=True the
+    most recent *finished* flight: if the plane is flying now, the load before this one.
 
     The trail is opt-in on purpose: the live-tracking poll hits this every few seconds and
     must stay tiny and fast. Only the hourly poller / "Fetch Plane Data" ask for the trail."""
@@ -426,10 +439,26 @@ def fetch_tail(tail, want_trail=False, all_flights=False, meta_only=False):
     result["icao24"] = icao or result.get("icao", "")
 
     pts = trace.get("points", [])
-    flights = split_flights(pts)
+    split_state = {}
+    flights = split_flights(pts, split_state)
+    # Flying now? Live fix that is airborne and moving (FR24's search hit is a rounded position
+    # with speed 0, so it never counts), or today's data ends mid-flight only minutes ago.
+    live_air = bool(live.get("found") and not live.get("on_ground")
+                    and (live.get("spd") or 0) >= FAST_KT and live.get("source") != "fr24-search")
+    last_open = bool(flights) and split_state.get("last_open", False)
+    in_progress = last_open and (live_air or (time.time() - pts[-1]["ts"] < CURRENT_FRESH_S))
+    result["flying_now"] = live_air or in_progress
+    result["current_flight_in_progress"] = in_progress
     if all_flights:
         chosen = pts
         result["trail_scope"] = "full_day"
+    elif completed:
+        # just took off and not yet 1,500 ft up: the current climb isn't a flight yet, so
+        # flights[-1] is already the previous load
+        done = flights[:-1] if in_progress else flights
+        chosen = done[-1] if done else []
+        result["trail_scope"] = "latest_completed_flight"
+        result["skipped_current"] = in_progress
     else:
         chosen = flights[-1] if flights else []
         result["trail_scope"] = "latest_flight"
@@ -547,6 +576,7 @@ class handler(BaseHTTPRequestHandler):
         trail_arg   = (params.get("trail",   [""])[0] or "").lower()
         want_trail  = trail_arg in ("1", "true", "yes", "meta")
         all_flights = (params.get("flights", [""])[0] or "").lower() == "all"
+        completed   = (params.get("completed", [""])[0] or "").lower() in ("1", "true", "yes")
         debug = (params.get("debug", [""])[0] or "").lower() in ("1", "true", "yes")
         try:
             if debug and (tail or icao):
@@ -554,7 +584,8 @@ class handler(BaseHTTPRequestHandler):
             elif icao and trace:
                 result = fetch_trace(icao)
             elif tail:
-                result = fetch_tail(tail, want_trail=want_trail, all_flights=all_flights, meta_only=(trail_arg == "meta"))
+                result = fetch_tail(tail, want_trail=want_trail, all_flights=all_flights, meta_only=(trail_arg == "meta"),
+                                    completed=completed)
             else:
                 result = {"error": "tail or icao required"}
         except Exception as e:
